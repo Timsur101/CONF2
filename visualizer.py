@@ -1,70 +1,101 @@
-import os
+#!/usr/bin/env python3
 import subprocess
-import configparser
+import tempfile
+import os
+from configparser import ConfigParser
 
-def read_config(config_path):
-    """Чтение конфигурационного файла."""
-    config = configparser.ConfigParser()
-    config.read(config_path)
-    return config['settings']
+def load_config(config_path):
+    cfg = ConfigParser()
+    cfg.read(config_path)
+    # Имена в config.ini должны совпадать, например:
+    # [DEFAULT]
+    # visualizer_path = C:\путь\к\plantuml.jar
+    # repository_path = C:\путь\к\репозиторию
+    # file_hash = <хеш_файла>
+    graph_tool = cfg.get("DEFAULT", "visualizer_path")
+    repo_path = cfg.get("DEFAULT", "repository_path")
+    file_hash = cfg.get("DEFAULT", "file_hash")
+    return graph_tool, repo_path, file_hash
 
-def get_commits_with_file(repo_path, file_hash):
-    """
-    Получение коммитов, связанных с файлом по его хешу.
-    Возвращает список [(хеш, сообщение)].
-    """
-    os.chdir(repo_path)  # Переходим в директорию репозитория
-    result = subprocess.run(
-        ["git", "log", "--all", "--pretty=format:%H|%s", "--", file_hash],
-        capture_output=True, text=True
-    )
-    commits = result.stdout.strip().split("\n")
-    return [line.split("|") for line in commits]
+def get_commits_for_file(repo_path, file_hash):
+    # Используем опцию -C для указания пути к репо
+    cmd = f'git -C "{repo_path}" rev-list --all'
+    commits = subprocess.check_output(cmd, shell=True).decode("utf-8").split()
 
-def generate_plantuml_graph(commits):
-    """
-    Генерация текста для графа в формате PlantUML.
-    Узлы графа - сообщения коммитов.
-    """
-    plantuml_text = ["@startuml"]
-    for i in range(len(commits) - 1):
-        plantuml_text.append(f'"{commits[i][1]}" --> "{commits[i + 1][1]}"')
-    plantuml_text.append("@enduml")
-    return "\n".join(plantuml_text)
+    relevant_commits = []
+    for c in commits:
+        ls_cmd = f'git -C "{repo_path}" ls-tree -r {c}'
+        ls_out = subprocess.check_output(ls_cmd, shell=True).decode("utf-8")
+        for line in ls_out.splitlines():
+            parts = line.strip().split()
+            # Формат: <mode> blob <hash> <tab> file
+            # parts[0] = mode, parts[1] = "blob", parts[2] = blob_hash, далее имя файла
+            if len(parts) >= 3 and parts[1] == "blob":
+                blob_h = parts[2]
+                if blob_h == file_hash:
+                    relevant_commits.append(c)
+                    break
+    return list(set(relevant_commits))
 
-def save_plantuml_file(content, filename="output/graph.puml"):
-    os.makedirs("output", exist_ok=True)  # Создаёт папку, если её нет
-    with open(filename, "w") as file:
-        file.write(content)
-    print(f"PlantUML файл сохранён: {filename}")
+def get_commit_details(repo_path, commit_hash):
+    # Используем двойные кавычки для формата
+    # %H - hash, %P - parents, %s - subject
+    cmd = f'git -C "{repo_path}" log --pretty=format:"%H %P %s" -1 {commit_hash}'
+    out = subprocess.check_output(cmd, shell=True).decode("utf-8")
+    parts = out.split(' ', 2)
+    chash = parts[0]
+    parents = parts[1].split() if len(parts) > 1 else []
+    message = parts[2] if len(parts) > 2 else ""
+    return chash, parents, message
+
+def build_graph(repo_path, commits):
+    graph = {}
+    for c in commits:
+        chash, parents, msg = get_commit_details(repo_path, c)
+        graph[chash] = {
+            "message": msg.strip(),
+            "parents": parents
+        }
+    return graph
+
+def generate_plantuml(graph):
+    lines = ["@startuml", "skinparam packageStyle rectangle"]
+    # Добавляем масштабирование
+    lines.append("scale 15")  # или lines.append("scale 300dpi")
+
+    nodes = {}
+    for commit, data in graph.items():
+        msg = data["message"]
+        short_msg = msg[:50].replace("[", "(").replace("]", ")")
+        nodes[commit] = f"[{short_msg}]"
+
+    for commit, data in graph.items():
+        if data["parents"]:
+            for p in data["parents"]:
+                if p in nodes:
+                    lines.append(f"{nodes[p]} --> {nodes[commit]}")
+
+    lines.append("@enduml")
+    return "\n".join(lines)
 
 
-def visualize_graph(plantuml_path, puml_file):
-    """
-    Запуск PlantUML для визуализации графа.
-    Требует установленный Java и plantuml.jar.
-    """
-    subprocess.run(["java", "-jar", plantuml_path, puml_file])
-
-def main():
-    # 1. Чтение конфигурации
-    config = read_config("config.ini")
-    visualizer_path = config["visualizer_path"]
-    repo_path = config["repository_path"]
-    file_hash = config["file_hash"]
-
-    # 2. Получение коммитов с упоминанием файла
-    commits = get_commits_with_file(repo_path, file_hash)
-    if not commits:
-        print("Нет коммитов для указанного файла!")
-        return
-
-    # 3. Построение графа зависимостей
-    plantuml_graph = generate_plantuml_graph(commits)
-    save_plantuml_file(plantuml_graph)
-
-    # 4. Визуализация графа
-    visualize_graph(visualizer_path, "graph.puml")
+def visualize(plantuml_text, graph_tool_path):
+    # Сохраняем исходник диаграммы PlantUML
+    puml_path = os.path.join(os.path.dirname(__file__), "graph.puml")
+    with open(puml_path, "w", encoding="utf-8") as f:
+        f.write(plantuml_text)
+    # Вызываем PlantUML
+    cmd = f'java -jar "{graph_tool_path}" "{puml_path}"'
+    subprocess.run(cmd, shell=True, check=True)
+    # По умолчанию PlantUML создаст graph.png в той же директории
+    png_file = puml_path.replace(".puml", ".png")
+    return png_file
 
 if __name__ == "__main__":
-    main()
+    config_path = os.path.join(os.path.dirname(__file__), "config.ini")
+    graph_tool, repo_path, file_hash = load_config(config_path)
+    commits = get_commits_for_file(repo_path, file_hash)
+    graph = build_graph(repo_path, commits)
+    puml = generate_plantuml(graph)
+    result_img = visualize(puml, graph_tool)
+    print("Граф сгенерирован:", result_img)
